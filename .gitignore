@@ -1,0 +1,4 @@
+data/*
+logs/*
+exp0_cache/*
+__pycache__
