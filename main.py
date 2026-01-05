@@ -15,22 +15,26 @@ from copy import deepcopy
 # 1. SETUP & UTILITIES
 # ==========================================
 
+# Device configuration - use GPU if available
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {DEVICE}")
+
 ALPHABET = ['A', 'C', 'G', 'T']
 A2I = {a: i for i, a in enumerate(ALPHABET)}
 I2A = {i: a for i, a in enumerate(ALPHABET)}
-L = 4
+L = 3  # Changed from 4 to 3 for faster computation (64 vs 256 states)
 N_STATES = len(ALPHABET) ** L
-SEQS = list(itertools.product(range(4), repeat=L)) # All 256 sequences as tuples of ints
+SEQS = list(itertools.product(range(4), repeat=L)) # All 64 sequences as tuples of ints
 
 def seq_to_idx(seq_tuple):
-    """Converts a sequence tuple (0,1,3,2) to a flat index 0-255."""
+    """Converts a sequence tuple (0,1,2) to a flat index 0-63."""
     idx = 0
     for i, token in enumerate(seq_tuple):
         idx += token * (4 ** (L - 1 - i))
     return idx
 
 def idx_to_seq(idx):
-    """Converts flat index 0-255 back to tensor shape (1, L)."""
+    """Converts flat index 0-63 back to tensor shape (1, L)."""
     seq = []
     rem = idx
     for i in range(L):
@@ -42,8 +46,8 @@ def idx_to_seq(idx):
 def hamming(s1, s2):
     return sum(1 for a, b in zip(s1, s2) if a != b)
 
-# Precompute all 256 sequences as a batch for fast evaluation
-ALL_SEQS_BATCH = torch.tensor(SEQS, dtype=torch.long) # (256, 4)
+# Precompute all 64 sequences as a batch for fast evaluation
+ALL_SEQS_BATCH = torch.tensor(SEQS, dtype=torch.long).to(DEVICE) # (64, 3)
 
 # ==========================================
 # 2. GROUND TRUTH PROCESS
@@ -52,13 +56,21 @@ ALL_SEQS_BATCH = torch.tensor(SEQS, dtype=torch.long) # (256, 4)
 class GroundTruthProcess:
     def __init__(self, seed=42, epistasis=0.0):
         """
-        Initialize ground truth process with optional epistasis.
+        Initialize ground truth process with linear interpolation epistasis.
 
         Args:
             seed: Random seed for reproducibility
             epistasis: Epistasis strength in [0, 1]
                 - 0.0: No epistasis (perfectly factorizable Q)
-                - 1.0: Maximum epistasis (rates vary ±100% based on context)
+                - 1.0: Maximum epistasis (fully state-dependent Q)
+
+        Implementation:
+            Q = (1 - epistasis) * Q_factorized + epistasis * Q_state_dependent
+
+        Where:
+            - Q_factorized: Site-independent rates (same for all contexts)
+            - Q_state_dependent: Fully random rates per transition (max context-dependency)
+            - All rates bounded in [0.1, 1.0] for numerical stability
         """
         np.random.seed(seed)
         self.epistasis = epistasis
@@ -69,13 +81,13 @@ class GroundTruthProcess:
             for a in range(4):
                 for b in range(4):
                     if a != b:
-                        self.base_rates[l, a, b] = np.random.uniform(0.1, 1.0)
+                        self.base_rates[l, a, b] = np.random.uniform(0.0, 2.0)
             # Set diagonal to -row_sum for each site's Q matrix
             for a in range(4):
                 self.base_rates[l, a, a] = -np.sum(self.base_rates[l, a, :])
 
-        # Step 2: Build 256x256 Q with context-dependent rates
-        self.Q_global = np.zeros((N_STATES, N_STATES))
+        # Step 2: Build Q_factorized (epistasis=0, site-independent)
+        Q_factorized = np.zeros((N_STATES, N_STATES))
         for i in range(N_STATES):
             s_i = SEQS[i]
             for j in range(N_STATES):
@@ -91,35 +103,38 @@ class GroundTruthProcess:
                             break
 
                     a, b = s_i[mutated_site], s_j[mutated_site]
+                    Q_factorized[i, j] = self.base_rates[mutated_site, a, b]
 
-                    # Get base rate
-                    base_rate = self.base_rates[mutated_site, a, b]
-
-                    # Apply context-dependent modification
-                    if self.epistasis > 0:
-                        # Extract context: all bases except the mutated site
-                        context = [s_i[k] for k in range(L) if k != mutated_site]
-                        # Hash-based modifier for reproducibility
-                        context_hash = sum(context[k] * (4**k) for k in range(len(context)))
-                        modifier = (context_hash % 100) / 50.0 - 1.0  # Range: [-1, 1]
-                        rate = base_rate * (1 + self.epistasis * modifier)
-                        rate = max(0.01, rate)  # Ensure positive
-                    else:
-                        rate = base_rate
-
-                    self.Q_global[i, j] = rate
-
-        # Set diagonal to -row_sum
+        # Set diagonal
         for i in range(N_STATES):
-            self.Q_global[i, i] = -np.sum(self.Q_global[i, :])
+            Q_factorized[i, i] = -np.sum(Q_factorized[i, :])
 
-        self.Q_torch = torch.tensor(self.Q_global, dtype=torch.float32)
+        # Step 3: Build Q_state_dependent (epistasis=1, fully state-dependent)
+        Q_state_dependent = np.zeros((N_STATES, N_STATES))
+        for i in range(N_STATES):
+            s_i = SEQS[i]
+            for j in range(N_STATES):
+                if i == j: continue
+                s_j = SEQS[j]
+
+                if hamming(s_i, s_j) == 1:
+                    # Each transition gets its own independent random rate
+                    Q_state_dependent[i, j] = np.random.uniform(0.0, 2.0)
+
+        # Set diagonal
+        for i in range(N_STATES):
+            Q_state_dependent[i, i] = -np.sum(Q_state_dependent[i, :])
+
+        # Step 4: Linear interpolation based on epistasis parameter
+        self.Q_global = (1.0 - self.epistasis) * Q_factorized + self.epistasis * Q_state_dependent
+
+        self.Q_torch = torch.tensor(self.Q_global, dtype=torch.float32).to(DEVICE)
 
     def get_P(self, b):
         """Returns exp(bQ) as a dense matrix."""
         return scipy.linalg.expm(b * self.Q_global)
 
-    def generate_data(self, n_samples, b_min=None, b_max=None, lambda_param=None, min_mutations=0):
+    def generate_data(self, n_samples, b_min=None, b_max=None, lambda_param=None, min_mutations=0, verbose=False, samples_per_branch=1000):
         """
         Generates (x_i, x_j, b) tuples with optional rejection sampling.
 
@@ -127,39 +142,52 @@ class GroundTruthProcess:
             n_samples: Number of samples to generate
             b_min, b_max: If provided, sample b ~ Uniform(b_min, b_max)
             lambda_param: If provided, sample b ~ Exponential(lambda_param), mean = 1/lambda_param
+            samples_per_branch: Number of samples to generate for each branch length
             min_mutations: Minimum number of mutations required (rejection sampling)
         """
         data = []
-        attempts = 0
-        max_attempts = n_samples * 100  # Prevent infinite loop
-
-        while len(data) < n_samples and attempts < max_attempts:
-            attempts += 1
-
-            # Sample branch length
+        total_attempts = 0
+        max_attempts = n_samples * 100  # Safety break
+        
+        while len(data) < n_samples and total_attempts < max_attempts:
+            
+            # 1. Sample branch length ONCE for this batch
             if lambda_param is not None:
                 b = np.random.exponential(1.0 / lambda_param)
             else:
                 b = np.random.uniform(b_min, b_max)
+            
+            # 2. Compute P matrix ONCE (Expensive operation)
             P = self.get_P(b)
+            
+            # 3. Generate multiple transitions using this P
+            # Vectorize the start indices selection for speed
+            start_indices = np.random.randint(0, N_STATES, size=samples_per_branch)
+            
+            for start_idx in start_indices:
+                total_attempts += 1
+                
+                # Sample end based on P[start_idx]
+                probs = P[start_idx]
+                probs /= probs.sum()  # Numerical stability
+                end_idx = np.random.choice(N_STATES, p=probs)
 
-            # Pick random start
-            start_idx = np.random.randint(0, N_STATES)
+                # Check mutation count
+                n_mutations = hamming(SEQS[start_idx], SEQS[end_idx])
 
-            # Sample end based on P[start_idx]
-            probs = P[start_idx]
-            probs /= probs.sum() # Numerical stability
-            end_idx = np.random.choice(N_STATES, p=probs)
-
-            # Check mutation count
-            n_mutations = hamming(SEQS[start_idx], SEQS[end_idx])
-
-            # Accept only if enough mutations
-            if n_mutations >= min_mutations:
-                data.append((ALL_SEQS_BATCH[start_idx], ALL_SEQS_BATCH[end_idx], b))
+                # Accept only if enough mutations
+                if n_mutations >= min_mutations:
+                    data.append((ALL_SEQS_BATCH[start_idx], ALL_SEQS_BATCH[end_idx], b))
+                
+                # Stop immediately if we have enough samples
+                if len(data) >= n_samples:
+                    break
+            
+            if verbose and len(data) % 50000 == 0:
+                print(f"Generated {len(data)}/{n_samples} samples...")
 
         if len(data) < n_samples:
-            print(f"Warning: Could only generate {len(data)}/{n_samples} samples after {attempts} attempts")
+            print(f"Warning: Could only generate {len(data)}/{n_samples} samples after {total_attempts} attempts")
 
         return data
 
@@ -229,9 +257,9 @@ class NeuralRateModel(nn.Module):
             # Get local rates for ALL contexts
             # local_qs: (256, L, 4, 4)
             local_qs = self(ALL_SEQS_BATCH)
-            
-            Q_rec = torch.zeros((N_STATES, N_STATES))
-            
+
+            Q_rec = torch.zeros((N_STATES, N_STATES), device=local_qs.device)
+
             for i in range(N_STATES):
                 s1 = SEQS[i] # e.g. (0, 0, 0, 0)
                 # Fill single site mutations
@@ -239,25 +267,25 @@ class NeuralRateModel(nn.Module):
                     # For site l, look at possible mutations a
                     curr_char = s1[l]
                     rate_mat = local_qs[i, l] # (4, 4)
-                    
+
                     for a in range(4):
                         if a == curr_char: continue
-                        
+
                         # Construct neighbor s2
                         s2_list = list(s1)
                         s2_list[l] = a
                         s2 = tuple(s2_list)
                         j = seq_to_idx(s2)
-                        
+
                         # The rate from i to j is determined by site l's rate matrix
                         # evaluated at context i
                         rate = rate_mat[curr_char, a]
                         Q_rec[i, j] = rate
-            
+
             # Set diagonals
             for i in range(N_STATES):
                 Q_rec[i, i] = -torch.sum(Q_rec[i, :])
-                
+
             return Q_rec
 
 class FullMLEModel(nn.Module):
@@ -290,7 +318,7 @@ class FullMLEModel(nn.Module):
 
     def build_Q(self):
         """Construct 256×256 rate matrix from parameters."""
-        Q = torch.zeros((N_STATES, N_STATES))
+        Q = torch.zeros((N_STATES, N_STATES), device=self.log_rates.device)
 
         # Fill off-diagonal Hamming-1 entries
         for (i, j), idx in self.param_indices.items():
@@ -341,7 +369,7 @@ class ContextIndependentRateModel(nn.Module):
             # Get local rates (context-independent, so same for all)
             local_qs = self(ALL_SEQS_BATCH)
 
-            Q_rec = torch.zeros((N_STATES, N_STATES))
+            Q_rec = torch.zeros((N_STATES, N_STATES), device=local_qs.device)
 
             for i in range(N_STATES):
                 s1 = SEQS[i]
@@ -370,7 +398,7 @@ class ContextIndependentRateModel(nn.Module):
 # 4. TRAINING LOOP
 # ==========================================
 
-def train_model(gt, train_data, use_snr=False, epochs=500, lr=0.01,
+def train_model(gt, train_data, use_snr=False, snr_eps=0.5, epochs=500, lr=0.01,
                 early_stop_patience=None, early_stop_tolerance=1e-4, verbose=True):
     """
     Train the factorized neural rate model.
@@ -379,6 +407,7 @@ def train_model(gt, train_data, use_snr=False, epochs=500, lr=0.01,
         gt: Ground truth process (for Q_true if early stopping enabled)
         train_data: List of (start, end, b) tuples
         use_snr: Whether to use SNR weighting (deprecated)
+        snr_eps: SNR weighting factor
         epochs: Maximum number of epochs
         lr: Learning rate
         early_stop_patience: If set, stop if error doesn't improve for this many epochs
@@ -389,13 +418,13 @@ def train_model(gt, train_data, use_snr=False, epochs=500, lr=0.01,
         model: Trained model
         history: Dict with 'epochs', 'losses', 'errors' (if early stopping enabled)
     """
-    model = NeuralRateModel()
+    model = NeuralRateModel().to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    # Pre-process data into tensors
-    starts = torch.stack([d[0] for d in train_data])
-    ends = torch.stack([d[1] for d in train_data])
-    bs = torch.tensor([d[2] for d in train_data], dtype=torch.float32)
+    # Pre-process data into tensors and move to device
+    starts = torch.stack([d[0] for d in train_data]).to(DEVICE)
+    ends = torch.stack([d[1] for d in train_data]).to(DEVICE)
+    bs = torch.tensor([d[2] for d in train_data], dtype=torch.float32).to(DEVICE)
 
     if verbose:
         print(f"Training {'SNR-Weighted' if use_snr else 'MLE'} (Size: {len(train_data)}, LR: {lr})...")
@@ -408,7 +437,7 @@ def train_model(gt, train_data, use_snr=False, epochs=500, lr=0.01,
     Q_true = None
 
     if early_stop_patience is not None:
-        Q_true = torch.tensor(gt.Q_global, dtype=torch.float32)
+        Q_true = torch.tensor(gt.Q_global, dtype=torch.float32).to(DEVICE)
         best_model_state = deepcopy(model.state_dict())  # Initialize with initial weights
 
     for epoch in range(epochs):
@@ -445,17 +474,17 @@ def train_model(gt, train_data, use_snr=False, epochs=500, lr=0.01,
             probs = p_matrix[torch.arange(len(train_data)), start_char, end_char]
             
             log_prob_total += torch.log(probs + 1e-9)
-            
+
         # 3. Loss Calculation
         nll = -log_prob_total
-        
+
         if use_snr:
-            # SNR Weighting: 1 / (b + epsilon)
-            weights = 1.0 / (bs + 1e-4)
+            # SNR Weighting: 1 / (snr_eps + b)
+            weights = 1.0 / (snr_eps + bs)
             loss = (nll * weights).mean()
         else:
             loss = nll.mean()
-            
+
         loss.backward()
         optimizer.step()
 
@@ -494,7 +523,7 @@ def train_model(gt, train_data, use_snr=False, epochs=500, lr=0.01,
     return model, history
 
 def train_full_mle_model(gt, train_data, epochs=500, lr=0.01, verbose=True, bucket_decimals=2, 
-                         early_stop_patience=50, early_stop_tolerance=0.001):
+                         early_stop_patience=50, early_stop_tolerance=0.001, weight_decay=0.0):
     """
     Train the full 256×256 MLE model via gradient descent with early stopping.
 
@@ -509,6 +538,7 @@ def train_full_mle_model(gt, train_data, epochs=500, lr=0.01, verbose=True, buck
         bucket_decimals: Decimals for bucketing b values (lower = faster, less precise)
         early_stop_patience: Stop if no improvement for N epochs
         early_stop_tolerance: Minimum improvement to reset patience
+        weight_decay: L2 regularization strength (default 0.0)
 
     Returns:
         model: Trained FullMLEModel
@@ -523,15 +553,15 @@ def train_full_mle_model(gt, train_data, epochs=500, lr=0.01, verbose=True, buck
         if verbose:
             print("Install tqdm for progress bars: pip install tqdm")
 
-    model = FullMLEModel()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    model = FullMLEModel().to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Pre-process data
-    starts_idx = torch.tensor([seq_to_idx(tuple(d[0].tolist())) for d in train_data], dtype=torch.long)
-    ends_idx = torch.tensor([seq_to_idx(tuple(d[1].tolist())) for d in train_data], dtype=torch.long)
-    bs = torch.tensor([d[2] for d in train_data], dtype=torch.float32)
+    # Pre-process data and move to device
+    starts_idx = torch.tensor([seq_to_idx(tuple(d[0].tolist())) for d in train_data], dtype=torch.long).to(DEVICE)
+    ends_idx = torch.tensor([seq_to_idx(tuple(d[1].tolist())) for d in train_data], dtype=torch.long).to(DEVICE)
+    bs = torch.tensor([d[2] for d in train_data], dtype=torch.float32).to(DEVICE)
 
-    Q_true = torch.tensor(gt.Q_global, dtype=torch.float32)
+    Q_true = torch.tensor(gt.Q_global, dtype=torch.float32).to(DEVICE)
     history = {'losses': [], 'errors': [], 'epoch_times': []}
 
     # Early stopping setup
@@ -646,7 +676,17 @@ def train_full_mle_model(gt, train_data, epochs=500, lr=0.01, verbose=True, buck
 # 4.5. CACHING INFRASTRUCTURE
 # ==========================================
 
+# Output directories
 CACHE_DIR = "./exp0_cache"
+PLOTS_DIR = "./plots"
+LOGS_DIR = "./logs"
+RESULTS_DIR = "./results"
+
+# Ensure directories exist
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(PLOTS_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 def get_cache_key(epistasis, seed, model_type, n_samples):
     """Generate unique cache key."""
@@ -696,13 +736,14 @@ def load_factorized_model(epistasis, seed, n_samples):
     if os.path.exists(path):
         save_dict = torch.load(path, weights_only=False)
         # Return the Q matrix directly (don't need to reconstruct model)
-        return torch.tensor(save_dict['Q_matrix'])
+        return torch.tensor(save_dict['Q_matrix']).to(DEVICE)
     return None
 
-def save_factorized_snr_model(model, epistasis, seed, n_samples):
+def save_factorized_snr_model(model, epistasis, seed, n_samples, snr_eps=0.5):
     """Save trained SNR-weighted factorized model."""
     os.makedirs(CACHE_DIR, exist_ok=True)
-    key = get_cache_key(epistasis, seed, "factorized_snr", n_samples)
+    model_name = f"factorized_snr_{snr_eps}"
+    key = get_cache_key(epistasis, seed, model_name, n_samples)
 
     # Save both the model state and the reconstructed Q matrix
     Q_matrix = model.build_global_Q()
@@ -711,19 +752,20 @@ def save_factorized_snr_model(model, epistasis, seed, n_samples):
         'Q_matrix': Q_matrix.cpu().numpy()
     }
 
-    path = os.path.join(CACHE_DIR, f"factorized_snr_{key}.pt")
+    path = os.path.join(CACHE_DIR, f"{model_name}_{key}.pt")
     torch.save(save_dict, path)
     print(f"  Saved SNR-weighted model to {path}")
     return path
 
-def load_factorized_snr_model(epistasis, seed, n_samples):
+def load_factorized_snr_model(epistasis, seed, n_samples, snr_eps=0.5):
     """Load cached SNR-weighted factorized model."""
-    key = get_cache_key(epistasis, seed, "factorized_snr", n_samples)
-    path = os.path.join(CACHE_DIR, f"factorized_snr_{key}.pt")
+    model_name = f"factorized_snr_{snr_eps}"
+    key = get_cache_key(epistasis, seed, model_name, n_samples)
+    path = os.path.join(CACHE_DIR, f"{model_name}_{key}.pt")
     if os.path.exists(path):
         save_dict = torch.load(path, weights_only=False)
         # Return the Q matrix directly (don't need to reconstruct model)
-        return torch.tensor(save_dict['Q_matrix'])
+        return torch.tensor(save_dict['Q_matrix']).to(DEVICE)
     return None
 
 def save_full_mle_matrix(Q_matrix, epistasis, seed, n_samples):
@@ -823,7 +865,7 @@ def run_experiment_1(gt):
     for lam in lambda_values:
         # Generate with rejection sampling (min_mutations=1)
         print(f"λ={lam}: Generating data with rejection sampling...", end='', flush=True)
-        data = gt.generate_data(5000, lambda_param=lam, min_mutations=1)
+        data = gt.generate_data(5000, lambda_param=lam, min_mutations=1, verbose=True)
 
         # Calculate actual statistics from generated data
         mutation_counts = []
@@ -891,15 +933,15 @@ def run_experiment_1(gt):
     plt.savefig('exp1_branch_length.png', dpi=150)
     print("Saved exp1_branch_length.png")
 
-def plot_experiment_0_comparison(summary):
-    """Plot comparison of factorized vs SNR-weighted vs full MLE with error bars."""
+def plot_experiment_0_comparison(summary, n_samples_factorized=10000, n_samples_full_mle=50000):
+    """Plot comparison of factorized vs factorized SNR vs full MLE with error bars."""
     eps_vals = [s['epistasis'] for s in summary]
 
     fact_means = [s['factorized_mean'] for s in summary]
     fact_stds = [s['factorized_std'] for s in summary]
 
-    snr_means = [s['snr_mean'] for s in summary]
-    snr_stds = [s['snr_std'] for s in summary]
+    fact_snr_means = [s['factorized_snr_mean'] for s in summary]
+    fact_snr_stds = [s['factorized_snr_std'] for s in summary]
 
     full_means = [s['full_mean'] for s in summary]
     full_stds = [s['full_std'] for s in summary]
@@ -911,19 +953,19 @@ def plot_experiment_0_comparison(summary):
     # Factorized model - blue
     plt.errorbar(eps_vals, fact_means, yerr=fact_stds,
                  fmt='o-', linewidth=1.5, markersize=5,
-                 color='#0173B2', label='Factorized',
+                 color='#0173B2', label=f'Factorized',
                  capsize=3, capthick=1.5, elinewidth=1.5)
 
-    # SNR-weighted factorized model - green
-    plt.errorbar(eps_vals, snr_means, yerr=snr_stds,
+    # Factorized SNR model - green
+    plt.errorbar(eps_vals, fact_snr_means, yerr=fact_snr_stds,
                  fmt='^-', linewidth=1.5, markersize=5,
-                 color='#009E73', label='Factorized + SNR',
+                 color='#029E73', label=f'Factorized SNR',
                  capsize=3, capthick=1.5, elinewidth=1.5)
 
     # Full MLE model - orange/amber
     plt.errorbar(eps_vals, full_means, yerr=full_stds,
                  fmt='s-', linewidth=1.5, markersize=5,
-                 color='#E69F00', label='Full MLE',
+                 color='#E69F00', label=f'Full MLE',
                  capsize=3, capthick=1.5, elinewidth=1.5)
 
     plt.xlabel('Epistasis Strength', fontsize=10)
@@ -933,8 +975,14 @@ def plot_experiment_0_comparison(summary):
     plt.xticks(eps_vals, fontsize=9)
     plt.yticks(fontsize=9)
     plt.tight_layout(pad=0.3)
-    plt.savefig('exp0_comparison.pdf', dpi=300, bbox_inches='tight')
-    print("\nSaved exp0_comparison.pdf")
+
+    plot_path = os.path.join(PLOTS_DIR, 'exp0_comparison.pdf')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+
+    # Also save PNG version for easier viewing
+    png_path = os.path.join(RESULTS_DIR, 'exp0_comparison.png')
+    plt.savefig(png_path, dpi=150, bbox_inches='tight')
+    print(f"\nSaved {plot_path} and {png_path}")
 
 def plot_convergence(epochs, errors, losses, full_mle_error, convergence_epoch=None, tolerance=0.2):
     """Plot convergence curves with convergence point marked."""
@@ -1072,7 +1120,12 @@ def run_experiment_0(seed=42):
 def run_experiment_0_with_replicates(
     epistasis_levels=[0.0, 0.3, 0.7, 1.0],
     n_replicates=5,
-    n_samples=50000,
+    lambda_param_factorized=0.5,
+    lambda_param_full_mle=0.5,
+    n_samples_factorized=10000,
+    n_samples_full_mle=50000,
+    weight_decay_full_mle=0.0001,
+    use_same_dataset=True,
     use_cache=True,
     force_retrain=False
 ):
@@ -1082,14 +1135,18 @@ def run_experiment_0_with_replicates(
     Args:
         epistasis_levels: List of epistasis strengths to test
         n_replicates: Number of independent replicates (for error bars)
-        n_samples: Dataset size (larger for good full model estimates)
+        n_samples_factorized: Dataset size for factorized model
+        n_samples_full_mle: Dataset size for full MLE model
+        weight_decay_full_mle: L2 regularization for full MLE (default 0.0001)
         use_cache: If True, load/save cached results
         force_retrain: If True, ignore cache and retrain everything
     """
     print("\n=== Experiment 0: Epistasis Analysis with Baselines ===")
     print(f"Epistasis levels: {epistasis_levels}")
     print(f"Replicates: {n_replicates}")
-    print(f"Samples per dataset: {n_samples}")
+    print(f"Samples (Factorized): {n_samples_factorized}")
+    print(f"Samples (Full MLE): {n_samples_full_mle}")
+    print(f"Weight decay (Full MLE): {weight_decay_full_mle}")
     print(f"Caching: {'ON' if use_cache else 'OFF'}")
     print(f"Force retrain: {'YES' if force_retrain else 'NO'}")
     print("=" * 70)
@@ -1108,119 +1165,147 @@ def run_experiment_0_with_replicates(
 
             # Create ground truth
             gt = GroundTruthProcess(seed=seed, epistasis=eps)
-            Q_true = torch.tensor(gt.Q_global, dtype=torch.float32)
+            Q_true = torch.tensor(gt.Q_global, dtype=torch.float32).to(DEVICE)
 
-            # ============ Dataset ============
-            data = None
+            # ============ Dataset for All Models ============
+            data_factorized = None
             if use_cache and not force_retrain:
-                data = load_dataset(eps, seed, n_samples)
-                if data:
-                    print(f"  Loaded cached dataset ({len(data)} samples)")
+                data_factorized = load_dataset(eps, seed, n_samples_factorized)
+                if data_factorized:
+                    print(f"  Loaded cached dataset for factorized ({len(data_factorized)} samples)")
 
-            if data is None:
-                print(f"  Generating {n_samples} samples...", end='', flush=True)
-                data = gt.generate_data(n_samples, lambda_param=1.0, min_mutations=1)
-                print(f" Done ({len(data)} samples)")
+            if data_factorized is None:
+                print(f"  Generating {n_samples_factorized} samples for factorized...", end='', flush=True)
+                data_factorized = gt.generate_data(n_samples_factorized, lambda_param=lambda_param_factorized, min_mutations=0, verbose=True)
+                print(f" Done ({len(data_factorized)} samples)")
+                # data_factorized = []
 
-                if use_cache:
-                    save_dataset(data, eps, seed, n_samples)
+                # if use_cache:
+                #     save_dataset(data_factorized, eps, seed, n_samples_factorized)
 
             # ============ Factorized Model ============
             Q_factorized = None
             if use_cache and not force_retrain:
-                Q_factorized = load_factorized_model(eps, seed, n_samples)
+                Q_factorized = load_factorized_model(eps, seed, n_samples_factorized)
                 if Q_factorized is not None:
                     print(f"  Loaded cached factorized model")
 
             if Q_factorized is None:
-                print(f"  Training factorized model...", end='', flush=True)
-                model, _ = train_model(gt, data, use_snr=False, epochs=500, lr=0.01)
+                print(f"  Training factorized model...")
+                model, _ = train_model(gt, data_factorized, use_snr=False, epochs=1000, lr=0.01,
+                                      early_stop_patience=50, early_stop_tolerance=0.001, verbose=True)
                 Q_factorized = model.build_global_Q()
-                print(f" Done")
+                print(f"  Done (trained with early stopping)")
 
                 if use_cache:
-                    save_factorized_model(model, eps, seed, n_samples)
+                    save_factorized_model(model, eps, seed, n_samples_factorized)
 
             error_factorized = torch.norm(Q_factorized - Q_true) / torch.norm(Q_true)
             all_results[eps]['factorized'].append(error_factorized.item())
             print(f"  Factorized error: {error_factorized.item():.4f}")
 
-            # ============ Factorized SNR-Weighted Model ============
+            # ============ Factorized Model (SNR-weighted) ============
+            # snr_eps = 0.5
+            snr_eps = 1-eps # ideal snr weighting is inversely proportional to epistasis strength
+            print(f"  SNR eps: {snr_eps}")
             Q_factorized_snr = None
             if use_cache and not force_retrain:
-                Q_factorized_snr = load_factorized_snr_model(eps, seed, n_samples)
+                Q_factorized_snr = load_factorized_snr_model(eps, seed, n_samples_factorized, snr_eps)
                 if Q_factorized_snr is not None:
                     print(f"  Loaded cached SNR-weighted model")
 
             if Q_factorized_snr is None:
-                print(f"  Training SNR-weighted model...", end='', flush=True)
-                model_snr, _ = train_model(gt, data, use_snr=True, epochs=500, lr=0.01)
+                print(f"  Training SNR-weighted factorized model...")
+                model_snr, _ = train_model(gt, data_factorized, use_snr=True, snr_eps=snr_eps, epochs=1000, lr=0.01,
+                                          early_stop_patience=50, early_stop_tolerance=0.001, verbose=True)
                 Q_factorized_snr = model_snr.build_global_Q()
-                print(f" Done")
+                print(f"  Done (trained with early stopping)")
 
                 if use_cache:
-                    save_factorized_snr_model(model_snr, eps, seed, n_samples)
+                    save_factorized_snr_model(model_snr, eps, seed, n_samples_factorized, snr_eps)
 
             error_factorized_snr = torch.norm(Q_factorized_snr - Q_true) / torch.norm(Q_true)
             all_results[eps]['factorized_snr'].append(error_factorized_snr.item())
-            print(f"  SNR-weighted error: {error_factorized_snr.item():.4f}")
+            print(f"  Factorized (SNR) error: {error_factorized_snr.item():.4f}")
 
-            # ============ Full MLE Model ============
+            # ============ Dataset for Full MLE Model ============
+            data_full_mle = None
+            if use_cache and not force_retrain and not use_same_dataset:
+                data_full_mle = load_dataset(eps, seed, n_samples_full_mle)
+                if data_full_mle:
+                    print(f"  Loaded cached dataset for full MLE ({len(data_full_mle)} samples)")
+
+            if data_full_mle is None and not use_same_dataset:
+                print(f"  Generating {n_samples_full_mle} samples for full MLE...", end='', flush=True)
+                data_full_mle = gt.generate_data(n_samples_full_mle, lambda_param=lambda_param_full_mle, min_mutations=0, verbose=True)
+                print(f" Done ({len(data_full_mle)} samples)")
+
+                # if use_cache:
+                #     save_dataset(data_full_mle, eps, seed, n_samples_full_mle)
+
+            if use_same_dataset:
+                print(f"  Using same dataset for full MLE as factorized ({len(data_factorized)} samples)")
+                data_full_mle = data_factorized
+
+            # ============ Full MLE Model (Gradient Descent) ============
             Q_full = None
             if use_cache and not force_retrain:
-                Q_full = load_full_mle_matrix(eps, seed, n_samples)
+                Q_full = load_full_mle_matrix(eps, seed, n_samples_full_mle)
                 if Q_full is not None:
                     print(f"  Loaded cached full MLE matrix")
-                    Q_full = torch.tensor(Q_full, dtype=torch.float32)
+                    Q_full = torch.tensor(Q_full, dtype=torch.float32).to(DEVICE)
 
             if Q_full is None:
-                Q_full_np = estimate_full_mle_q(data, gt)
-                Q_full = torch.tensor(Q_full_np, dtype=torch.float32)
+                print(f"  Training full MLE model (gradient descent, L2={weight_decay_full_mle})...")
+                model_full, _ = train_full_mle_model(gt, data_full_mle, epochs=1000, lr=0.1, verbose=False,
+                                                     early_stop_patience=50, early_stop_tolerance=0.001,
+                                                     weight_decay=weight_decay_full_mle)
+                Q_full = model_full.build_Q()
 
                 if use_cache:
-                    save_full_mle_matrix(Q_full_np, eps, seed, n_samples)
+                    save_full_mle_matrix(Q_full.detach().cpu().numpy(), eps, seed, n_samples_full_mle)
 
             error_full = torch.norm(Q_full - Q_true) / torch.norm(Q_true)
             all_results[eps]['full_mle'].append(error_full.item())
-            print(f"  Full MLE error: {error_full.item():.4f}")
+            print(f"  Full MLE (GD) error: {error_full.item():.4f}")
 
     # ============ Aggregate Results ============
     print("\n" + "=" * 70)
     print("SUMMARY ACROSS REPLICATES")
     print("=" * 70)
-    print(f"{'Epistasis':<12} {'Factorized':<18} {'SNR-Weighted':<18} {'Full MLE':<18}")
+    print(f"{'Epistasis':<12} {'Factorized':<18} {'Fact. SNR':<18} {'Full MLE (GD)':<18}")
     print(f"{'':12} {'Mean ± Std':<18} {'Mean ± Std':<18} {'Mean ± Std':<18}")
     print("-" * 70)
 
     summary = []
     for eps in epistasis_levels:
         fact_errors = all_results[eps]['factorized']
-        snr_errors = all_results[eps]['factorized_snr']
+        fact_snr_errors = all_results[eps]['factorized_snr']
         full_errors = all_results[eps]['full_mle']
 
         fact_mean = np.mean(fact_errors)
         fact_std = np.std(fact_errors, ddof=1) if len(fact_errors) > 1 else 0
-        snr_mean = np.mean(snr_errors)
-        snr_std = np.std(snr_errors, ddof=1) if len(snr_errors) > 1 else 0
+        fact_snr_mean = np.mean(fact_snr_errors)
+        fact_snr_std = np.std(fact_snr_errors, ddof=1) if len(fact_snr_errors) > 1 else 0
         full_mean = np.mean(full_errors)
         full_std = np.std(full_errors, ddof=1) if len(full_errors) > 1 else 0
 
         print(f"{eps:<12.1f} {fact_mean:.4f}±{fact_std:.4f}    "
-              f"{snr_mean:.4f}±{snr_std:.4f}    "
+              f"{fact_snr_mean:.4f}±{fact_snr_std:.4f}    "
               f"{full_mean:.4f}±{full_std:.4f}")
 
         summary.append({
             'epistasis': eps,
             'factorized_mean': fact_mean,
             'factorized_std': fact_std,
-            'snr_mean': snr_mean,
-            'snr_std': snr_std,
+            'factorized_snr_mean': fact_snr_mean,
+            'factorized_snr_std': fact_snr_std,
             'full_mean': full_mean,
             'full_std': full_std
         })
 
     # ============ Plot Results ============
-    plot_experiment_0_comparison(summary)
+    plot_experiment_0_comparison(summary, n_samples_factorized, n_samples_full_mle)
 
     return summary
 
