@@ -1940,7 +1940,7 @@ def run_experiment_4_gillespie(gt, model):
             # Re-evaluate local Qs at current sequence
             # Note: In a real efficient impl, we only update rows that changed.
             # Here we just run the net (it's fast enough for L=4)
-            curr_tens = torch.tensor([curr_seq], dtype=torch.long)
+            curr_tens = torch.tensor([curr_seq], dtype=torch.long).to(DEVICE)
             with torch.no_grad():
                 local_qs = model(curr_tens)[0] # (L, 4, 4)
             
