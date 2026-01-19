@@ -1,18 +1,18 @@
 """
 Run Experiment 4: Sampling Method Comparison (EXACT KL DIVERGENCE)
 
-Compare site-independent vs global Q sampling for factorized models
-(with and without SNR weighting) against ground truth across branch lengths.
+Compare site-independent vs global Q sampling for the factorized model
+against ground truth across branch lengths and epistasis values.
 
 Configuration:
-- Ground truth: epistasis=0.5, seed=42
+- Ground truth: Various epistasis values [0.0, 0.25, 0.5, 0.75, 1.0], seed=42
 - Training: 2.5M samples, lambda=0.5
-- Branch lengths: 20 linearly-spaced values from 0.01 to 2.0
+- Branch lengths: 30 logarithmically-spaced values from 0.01 to 10.0
 - Metrics: EXACT KL divergence (no sampling - computed from full distributions)
 
 Two sampling methods compared:
-1. Site-Independent: Product of local site transition probabilities (approximation)
-2. Global Q: Full 64x64 matrix exponential from factorized model (exact)
+1. Matrix-Exp (Site-Independent): Product of local site transition probabilities (approximation)
+2. Gillespie (Global Q): Full 64x64 matrix exponential from factorized model (exact)
 
 Two evaluation modes:
 1. Single starting state (AAA)
@@ -22,6 +22,7 @@ Key improvements:
 - No sampling noise (exact distributions)
 - Both single-state and uniform-average KL
 - Very fast execution (~seconds instead of hours)
+- Uses cached models for efficiency
 """
 
 import numpy as np
@@ -31,7 +32,6 @@ import os
 from main import (
     GroundTruthProcess, train_model, NeuralRateModel,
     save_factorized_model, load_factorized_model,
-    save_factorized_snr_model, load_factorized_snr_model,
     get_cache_key,
     DEVICE, L, N_STATES, SEQS, seq_to_idx, PLOTS_DIR, CACHE_DIR
 )
@@ -179,10 +179,8 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
     # ========== Check if we need to train any models ==========
     key = get_cache_key(epistasis, seed, "factorized", n_samples_train)
     cache_path = os.path.join(CACHE_DIR, f"factorized_{key}.pt")
-    key_snr = get_cache_key(epistasis, seed, "factorized_snr", n_samples_train)
-    cache_path_snr = os.path.join(CACHE_DIR, f"factorized_snr_{key_snr}.pt")
 
-    need_training = not (os.path.exists(cache_path) and os.path.exists(cache_path_snr))
+    need_training = not os.path.exists(cache_path)
 
     # ========== Generate Training Data ==========
     if need_training:
@@ -193,10 +191,10 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
         print("\n[2/5] Skipping data generation (all models cached)...")
         data = None
 
-    # ========== Train/Load Factorized Models ==========
-    print("\n[3/5] Training/loading factorized models...")
+    # ========== Train/Load Factorized Model ==========
+    print("\n[3/5] Training/loading factorized model...")
 
-    # Model 1: Standard factorized (no SNR)
+    # Standard factorized model
     if os.path.exists(cache_path):
         print(f"  Loading cached factorized model...")
         save_dict = torch.load(cache_path, weights_only=False, map_location=DEVICE)
@@ -206,7 +204,7 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
         error_factorized = torch.norm(Q_factorized - Q_true) / torch.norm(Q_true)
         print(f"  Loaded from cache. Error: {error_factorized.item():.4f}")
     else:
-        print(f"  Training factorized model (no SNR)...")
+        print(f"  Training factorized model...")
         model_factorized, _ = train_model(gt, data, use_snr=False, epochs=1000, lr=0.01,
                                          early_stop_patience=50, early_stop_tolerance=0.001, verbose=True)
         Q_factorized = model_factorized.build_global_Q()
@@ -216,27 +214,6 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
         # Save to cache
         save_factorized_model(model_factorized, epistasis, seed, n_samples_train)
 
-    # Model 2: SNR-weighted factorized
-    if os.path.exists(cache_path_snr):
-        print(f"  Loading cached SNR-weighted model...")
-        save_dict = torch.load(cache_path_snr, weights_only=False, map_location=DEVICE)
-        model_factorized_snr = NeuralRateModel().to(DEVICE)
-        model_factorized_snr.load_state_dict(save_dict['model_state'])
-        Q_factorized_snr = model_factorized_snr.build_global_Q()
-        error_factorized_snr = torch.norm(Q_factorized_snr - Q_true) / torch.norm(Q_true)
-        print(f"  Loaded from cache. Error: {error_factorized_snr.item():.4f}")
-    else:
-        print(f"  Training SNR-weighted factorized model...")
-        snr_eps = 1-epistasis
-        model_factorized_snr, _ = train_model(gt, data, use_snr=True, snr_eps=snr_eps, epochs=1000, lr=0.01,
-                                             early_stop_patience=50, early_stop_tolerance=0.001, verbose=True)
-        Q_factorized_snr = model_factorized_snr.build_global_Q()
-        error_factorized_snr = torch.norm(Q_factorized_snr - Q_true) / torch.norm(Q_true)
-        print(f"  SNR-weighted model error: {error_factorized_snr.item():.4f}")
-
-        # Save to cache
-        save_factorized_snr_model(model_factorized_snr, epistasis, seed, n_samples_train)
-
     # ========== Compute Exact KL Divergences ==========
     print("\n[4/5] Computing exact KL divergences...")
     print(f"  Testing {len(branch_lengths)} branch lengths...")
@@ -245,15 +222,11 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
         'branch_lengths': branch_lengths,
         'single_state': {
             'factorized_site_indep': [],
-            'factorized_global_q': [],
-            'snr_site_indep': [],
-            'snr_global_q': []
+            'factorized_global_q': []
         },
         'uniform_avg': {
             'factorized_site_indep': [],
-            'factorized_global_q': [],
-            'snr_site_indep': [],
-            'snr_global_q': []
+            'factorized_global_q': []
         }
     }
 
@@ -269,21 +242,13 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
         p_fact_site_indep = compute_site_independent_distribution(model_factorized, start_idx, b)
         p_fact_global_q = compute_global_q_distribution(model_factorized, start_idx, b)
 
-        # SNR model distributions
-        p_snr_site_indep = compute_site_independent_distribution(model_factorized_snr, start_idx, b)
-        p_snr_global_q = compute_global_q_distribution(model_factorized_snr, start_idx, b)
-
         # Compute KL divergences for single state
         results['single_state']['factorized_site_indep'].append(compute_kl_divergence(p_fact_site_indep, p_true))
         results['single_state']['factorized_global_q'].append(compute_kl_divergence(p_fact_global_q, p_true))
-        results['single_state']['snr_site_indep'].append(compute_kl_divergence(p_snr_site_indep, p_true))
-        results['single_state']['snr_global_q'].append(compute_kl_divergence(p_snr_global_q, p_true))
 
         # ========== Uniform Average Over All Starting States ==========
         kl_fact_site_indep_avg = 0.0
         kl_fact_global_q_avg = 0.0
-        kl_snr_site_indep_avg = 0.0
-        kl_snr_global_q_avg = 0.0
 
         for start_idx_avg in range(N_STATES):
             # Ground truth
@@ -293,49 +258,37 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
             p_fact_site_indep_avg = compute_site_independent_distribution(model_factorized, start_idx_avg, b)
             p_fact_global_q_avg = compute_global_q_distribution(model_factorized, start_idx_avg, b)
 
-            # SNR
-            p_snr_site_indep_avg = compute_site_independent_distribution(model_factorized_snr, start_idx_avg, b)
-            p_snr_global_q_avg = compute_global_q_distribution(model_factorized_snr, start_idx_avg, b)
-
             # Accumulate KL divergences
             kl_fact_site_indep_avg += compute_kl_divergence(p_fact_site_indep_avg, p_true_avg)
             kl_fact_global_q_avg += compute_kl_divergence(p_fact_global_q_avg, p_true_avg)
-            kl_snr_site_indep_avg += compute_kl_divergence(p_snr_site_indep_avg, p_true_avg)
-            kl_snr_global_q_avg += compute_kl_divergence(p_snr_global_q_avg, p_true_avg)
 
         # Average over all starting states
         results['uniform_avg']['factorized_site_indep'].append(kl_fact_site_indep_avg / N_STATES)
         results['uniform_avg']['factorized_global_q'].append(kl_fact_global_q_avg / N_STATES)
-        results['uniform_avg']['snr_site_indep'].append(kl_snr_site_indep_avg / N_STATES)
-        results['uniform_avg']['snr_global_q'].append(kl_snr_global_q_avg / N_STATES)
 
     # ========== Print Summary ==========
     print("\n" + "=" * 70)
     print("SUMMARY: KL Divergence at Key Branch Lengths (Single State)")
     print("=" * 70)
-    print(f"{'Branch':<10} {'Fact+SiteInd':<15} {'Fact+GlobalQ':<15} {'SNR+SiteInd':<15} {'SNR+GlobalQ':<15}")
+    print(f"{'Branch':<10} {'Matrix-Exp':<15} {'Gillespie':<15}")
     print("-" * 70)
 
     key_indices = [0, 7, 14, 21, 29]  # Roughly 0.01, 0.05, 0.25, 1.0, 5.0
     for idx in key_indices:
         b = branch_lengths[idx]
         print(f"{b:<10.3f} {results['single_state']['factorized_site_indep'][idx]:<15.6f} "
-              f"{results['single_state']['factorized_global_q'][idx]:<15.6f} "
-              f"{results['single_state']['snr_site_indep'][idx]:<15.6f} "
-              f"{results['single_state']['snr_global_q'][idx]:<15.6f}")
+              f"{results['single_state']['factorized_global_q'][idx]:<15.6f}")
 
     print("\n" + "=" * 70)
     print("SUMMARY: KL Divergence at Key Branch Lengths (Uniform Average)")
     print("=" * 70)
-    print(f"{'Branch':<10} {'Fact+SiteInd':<15} {'Fact+Gillespie':<15} {'SNR+SiteInd':<15} {'SNR+Gillespie':<15}")
+    print(f"{'Branch':<10} {'Matrix-Exp':<15} {'Gillespie':<15}")
     print("-" * 70)
 
     for idx in key_indices:
         b = branch_lengths[idx]
         print(f"{b:<10.3f} {results['uniform_avg']['factorized_site_indep'][idx]:<15.6f} "
-              f"{results['uniform_avg']['factorized_global_q'][idx]:<15.6f} "
-              f"{results['uniform_avg']['snr_site_indep'][idx]:<15.6f} "
-              f"{results['uniform_avg']['snr_global_q'][idx]:<15.6f}")
+              f"{results['uniform_avg']['factorized_global_q'][idx]:<15.6f}")
 
     # ========== Plot Results ==========
     print("\n[5/5] Generating plot...")
@@ -343,19 +296,14 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
     # Single plot: Uniform Average only
     plt.figure(figsize=(3.25, 2.5))
 
-    # Colorblind-friendly colors
-    color_fact = '#0173B2'  # Blue
-    color_snr = '#029E73'   # Green
+    # Blue color for factorized model
+    color_blue = '#0173B2'  # Blue
 
-    # Plot uniform average results
+    # Plot uniform average results - two lines only
     plt.plot(branch_lengths, results['uniform_avg']['factorized_site_indep'],
-             '-', linewidth=1.5, color=color_fact, label='Fact + Matrix-Exp')
+             '-', linewidth=1.5, color=color_blue, label='Matrix-Exp')
     plt.plot(branch_lengths, results['uniform_avg']['factorized_global_q'],
-             ':', linewidth=2.0, color=color_fact, label='Fact + Gillespie')
-    plt.plot(branch_lengths, results['uniform_avg']['snr_site_indep'],
-             '-', linewidth=1.5, color=color_snr, label='SNR + Matrix-Exp')
-    plt.plot(branch_lengths, results['uniform_avg']['snr_global_q'],
-             ':', linewidth=2.0, color=color_snr, label='SNR + Gillespie')
+             ':', linewidth=2.0, color=color_blue, label='Gillespie')
 
     plt.xscale('log')
     plt.xlabel('Branch Length', fontsize=10)
@@ -365,11 +313,6 @@ def run_experiment_4_single(epistasis, seed=42, n_samples_train=2500000, lambda_
     plt.xticks(fontsize=9)
     plt.yticks(fontsize=9)
     plt.tight_layout(pad=0.3)
-    
-    # use decimal notation for x-ticks instead of scientific notation
-    # plt.gca().xaxis.set_major_formatter(plt.ScalarFormatter(useMathText=True))
-    # plt.gca().xaxis.set_minor_formatter(plt.ScalarFormatter(useMathText=True))
-    # plt.gca().ticklabel_format(axis='x', style='plain', scilimits=(0,0))
 
     # Save plot with epistasis-specific filename
     os.makedirs(PLOTS_DIR, exist_ok=True)
