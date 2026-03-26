@@ -3,4 +3,7 @@ logs/*
 exp0_cache/*
 exp2_cache/*
 exp3_cache/*
+exp4_cache/*
+exp5_cache/*
 __pycache__
+.venv
