@@ -18,7 +18,7 @@ from run_experiment_5 import (
 )
 
 # Configuration
-CHECKPOINT_PATH = "./exp5_wag_checkpoint.pkl"
+CHECKPOINT_PATH = "./exp5_cache/exp5_wag_checkpoint.pkl"
 TEST_FILE = TEST_DIR / "v1rodriguezCC.txt"
 
 # Branch length buckets (nice round numbers)
